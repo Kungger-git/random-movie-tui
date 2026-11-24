@@ -29,9 +29,9 @@ use ratatui_image::{
 use tokio::sync::mpsc;
 
 use crate::{
-    app::{App, StatusKind},
+    app::{App, FilterField, StatusKind},
     cache::PosterCache,
-    config::{Cli, Config, MAX_COUNT, SourceChoice},
+    config::{Cli, Config, MAX_COUNT},
     movie::Movie,
     providers::{Batch as MovieBatch, Providers},
 };
@@ -98,7 +98,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
     let cache = PosterCache::new();
     let (tx, rx) = mpsc::unbounded_channel();
 
-    let mut app = App::new(config.count, config.mode);
+    let mut app = App::new(config.count, config.mode, config.filters.clone());
     let mut runtime = Runtime {
         terminal,
         picker,
@@ -175,12 +175,13 @@ impl Runtime<'_> {
     fn refresh(&mut self) {
         let generation = self.app.begin_refresh();
         let count = self.app.count;
+        let filters = self.app.filters.clone();
         let providers = Arc::clone(&self.providers);
         let tx = self.tx.clone();
 
         tokio::spawn(async move {
             let result = providers
-                .fetch(count)
+                .fetch(count, &filters)
                 .await
                 .map_err(|error| error_summary(&error));
             let _ = tx.send(Msg::Batch { generation, result });
@@ -205,6 +206,11 @@ impl Runtime<'_> {
             return;
         }
 
+        if self.app.filter_editor.is_some() {
+            self.handle_filter_editor_key(key);
+            return;
+        }
+
         if self.app.help {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('?') => self.app.help = false,
@@ -217,6 +223,12 @@ impl Runtime<'_> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.app.should_quit = true,
             KeyCode::Char('?') => self.app.help = true,
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                self.app.open_filter_editor(FilterField::Language);
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.app.open_filter_editor(FilterField::From);
+            }
             KeyCode::Char(' ') | KeyCode::Char('r') | KeyCode::Char('R') => self.refresh(),
             KeyCode::Enter | KeyCode::Char('o') => self.open_selected(),
             KeyCode::Char(digit @ '1'..='9') => {
@@ -237,6 +249,30 @@ impl Runtime<'_> {
             KeyCode::PageDown => self.app.move_selection_rows(1),
             KeyCode::Home | KeyCode::Char('g') => self.app.select_first(),
             KeyCode::End | KeyCode::Char('G') => self.app.select_last(),
+            _ => {}
+        }
+    }
+
+    fn handle_filter_editor_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.app.close_filter_editor(),
+            KeyCode::Enter => {
+                if self.app.apply_filter_editor().is_some() {
+                    self.refresh();
+                }
+            }
+            KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => {
+                self.app.filter_editor_focus(true);
+            }
+            KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => {
+                self.app.filter_editor_focus(false);
+            }
+            KeyCode::Left | KeyCode::Char('h') => self.app.filter_editor_change(false),
+            KeyCode::Right | KeyCode::Char('l') => self.app.filter_editor_change(true),
+            KeyCode::Backspace => self.app.filter_editor_backspace(),
+            KeyCode::Char(digit) if digit.is_ascii_digit() => {
+                self.app.filter_editor_digit(digit);
+            }
             _ => {}
         }
     }
@@ -304,12 +340,6 @@ impl Runtime<'_> {
     fn show_idle_hint(&mut self) {
         if let Some(warning) = &self.startup_warning {
             self.app.set_status(StatusKind::Warning, warning.clone());
-        } else if self.app.mode == SourceChoice::Auto
-            && !self.providers.has_credentials()
-            && self.app.active_source == Some(crate::movie::Source::Wikipedia)
-        {
-            self.app
-                .set_status(StatusKind::Info, "No TMDB key set — using Wikipedia");
         }
     }
 

@@ -9,7 +9,7 @@ use ratatui_image::Image;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    app::{App, StatusKind},
+    app::{App, FilterField, StatusKind},
     config, layout,
     movie::{Movie, Source},
 };
@@ -33,6 +33,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, image_backend: &str) {
 
     if app.help {
         draw_help(frame, app);
+    }
+    if app.filter_editor.is_some() {
+        draw_filter_editor(frame, app);
     }
 }
 
@@ -113,6 +116,10 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
     ));
+    let filters = app.filter_summary();
+    if !filters.is_empty() {
+        left_spans.push(Span::styled(format!(" · {filters}"), Style::new().fg(DIM)));
+    }
     if !app.movies.is_empty() && app.movies.len() != app.count {
         left_spans.push(Span::styled(
             format!(" ({} found)", app.movies.len()),
@@ -221,7 +228,12 @@ fn draw_empty(frame: &mut Frame, app: &App, body: Rect, message: &str) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!("Press space to pick {} movie(s)", app.count),
+            match app.filter_summary() {
+                summary if summary.is_empty() => {
+                    format!("Press space to pick {} movie(s)", app.count)
+                }
+                summary => format!("Press space to pick {} movie(s) from {summary}", app.count),
+            },
             Style::new().fg(DIM),
         )),
     ]))
@@ -487,7 +499,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, image_backend: &str) {
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
 
     let mut spans = Vec::new();
-    let compact = inner.width < 86;
+    let compact = inner.width < 96;
     spans.extend(key_hint("space", "another"));
     if !compact {
         spans.push(Span::styled("   ", Style::new()));
@@ -498,6 +510,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, image_backend: &str) {
     } else {
         spans.push(Span::styled("  ", Style::new()));
     }
+    spans.extend(key_hint("f", "filters"));
+    spans.push(Span::styled("  ", Style::new()));
     spans.extend(key_hint("o", "open"));
     spans.push(Span::styled("  ", Style::new()));
     spans.extend(key_hint("?", "help"));
@@ -532,7 +546,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, image_backend: &str) {
 fn draw_help(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let width = 70.min(area.width.saturating_sub(4));
-    let height = 25.min(area.height.saturating_sub(2));
+    let height = 27.min(area.height.saturating_sub(2));
     let rect = centered_rect(area, width, height);
     if rect.width < 20 || rect.height < 5 {
         return;
@@ -558,10 +572,17 @@ fn draw_help(frame: &mut Frame, app: &App) {
     let source = match app.active_source {
         Some(source) => source.label().to_owned(),
         None => match app.mode {
-            config::SourceChoice::Auto => "automatic (TMDB, else Wikipedia)".to_owned(),
+            config::SourceChoice::Auto => "automatic".to_owned(),
             config::SourceChoice::Tmdb => "TMDB".to_owned(),
             config::SourceChoice::Wikipedia => "Wikipedia".to_owned(),
         },
+    };
+
+    let filters = app.filter_summary();
+    let filters = if filters.is_empty() {
+        "any filters".to_owned()
+    } else {
+        filters
     };
 
     let lines = vec![
@@ -569,6 +590,8 @@ fn draw_help(frame: &mut Frame, app: &App) {
         help_line("space / r", "pick another set of movies"),
         help_line("1 – 9", "show 1 to 9 movies"),
         help_line("+ / -", "adjust how many movies"),
+        help_line("f", "choose years, language, and popularity"),
+        help_line("y", "choose a year range"),
         help_line("← → ↑ ↓", "move between movies"),
         help_line("mouse wheel", "move between movies"),
         help_line("PgUp / PgDn", "jump a screenful"),
@@ -581,9 +604,15 @@ fn draw_help(frame: &mut Frame, app: &App) {
         Line::from(vec![
             Span::styled("Active: ", Style::new().fg(DIM)),
             Span::styled(source, Style::new().fg(Color::White)),
+            Span::styled("  ·  ", Style::new().fg(DIM)),
+            Span::styled(filters, Style::new().fg(Color::White)),
         ]),
         Line::from(Span::styled(
             "TMDB needs a free API key. Wikipedia needs no key.",
+            Style::new().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            "Wikipedia language is best-effort; popularity needs TMDB.",
             Style::new().fg(Color::Gray),
         )),
         Line::from(vec![
@@ -605,6 +634,105 @@ fn draw_help(frame: &mut Frame, app: &App) {
         )),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_filter_editor(frame: &mut Frame, app: &App) {
+    let Some(editor) = &app.filter_editor else {
+        return;
+    };
+    let area = frame.area();
+    let width = 54.min(area.width.saturating_sub(4));
+    let height = 15.min(area.height.saturating_sub(2));
+    let rect = centered_rect(area, width, height);
+    if rect.width < 30 || rect.height < 10 {
+        return;
+    }
+
+    frame.render_widget(Clear, rect);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .title(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                " Filters ",
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]))
+        .style(Style::new().bg(Color::Reset));
+    let inner = block.inner(rect).inner(Margin::new(2, 1));
+    frame.render_widget(block, rect);
+
+    let field = |label: &'static str, value: &str, focused: bool| {
+        let text = if value.is_empty() {
+            "····".to_owned()
+        } else {
+            value.to_owned()
+        };
+        let style = if focused {
+            Style::new()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::White)
+        };
+        Line::from(vec![
+            Span::styled(format!("{label:<12}"), Style::new().fg(DIM)),
+            Span::styled(format!(" {text} "), style),
+        ])
+    };
+    let choice = |label: &'static str, value: &str, focused: bool| {
+        field(label, &format!("‹ {value} ›"), focused)
+    };
+
+    let popularity_focused = editor.focus == FilterField::Popularity;
+    let popularity_style = if popularity_focused {
+        Style::new()
+            .fg(Color::Black)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(Color::White)
+    };
+    let mut popularity_spans = vec![
+        Span::styled(format!("{:<12}", "Popularity"), Style::new().fg(DIM)),
+        Span::styled(
+            format!(" ‹ {} › ", editor.popularity.label()),
+            popularity_style,
+        ),
+    ];
+    if app.active_source == Some(Source::Wikipedia) && editor.popularity != config::Popularity::Any
+    {
+        popularity_spans.push(Span::styled("TMDB only", Style::new().fg(Color::Yellow)));
+    }
+
+    let lines = vec![
+        field("From", &editor.from, editor.focus == FilterField::From),
+        field("To", &editor.to, editor.focus == FilterField::To),
+        choice(
+            "Language",
+            editor.language.label(),
+            editor.focus == FilterField::Language,
+        ),
+        Line::from(popularity_spans),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Tab/↑↓ field · ←→ change",
+            Style::new().fg(DIM),
+        )),
+        Line::from(Span::styled(
+            "Enter apply · Esc cancel",
+            Style::new().fg(DIM),
+        )),
+        Line::from(Span::styled(
+            "Empty years use the default bound.",
+            Style::new().fg(DIM),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn help_line(key: &'static str, description: &'static str) -> Line<'static> {
@@ -703,7 +831,11 @@ mod tests {
     use ratatui_image::FontSize;
 
     use super::*;
-    use crate::{app::App, config::SourceChoice, movie::Movie};
+    use crate::{
+        app::App,
+        config::{Filters, Language, Popularity, SourceChoice, YearRange},
+        movie::Movie,
+    };
 
     fn movie(index: u64) -> Movie {
         Movie {
@@ -719,18 +851,28 @@ mod tests {
         }
     }
 
-    fn render(app: &mut App, width: u16, height: u16) {
+    fn render(app: &mut App, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let area: Rect = terminal.size().unwrap().into();
         app.prepare_layout(area, FontSize::new(10, 20));
         terminal
             .draw(|frame| draw(frame, app, "half-blocks"))
             .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
     }
 
     #[test]
     fn draws_single_movie() {
-        let mut app = App::new(1, SourceChoice::Tmdb);
+        let mut app = App::new(1, SourceChoice::Tmdb, Filters::default());
         app.movies = vec![movie(1)];
         app.active_source = Some(Source::Tmdb);
         render(&mut app, 100, 35);
@@ -738,7 +880,7 @@ mod tests {
 
     #[test]
     fn draws_grid_and_keeps_titles_inside() {
-        let mut app = App::new(6, SourceChoice::Tmdb);
+        let mut app = App::new(6, SourceChoice::Tmdb, Filters::default());
         app.movies = (1..=6).map(movie).collect();
         app.active_source = Some(Source::Tmdb);
         render(&mut app, 120, 40);
@@ -746,11 +888,54 @@ mod tests {
 
     #[test]
     fn draws_loading_and_help_states() {
-        let mut app = App::new(4, SourceChoice::Wikipedia);
+        let mut app = App::new(4, SourceChoice::Wikipedia, Filters::default());
         app.loading = true;
         render(&mut app, 80, 24);
         app.help = true;
         render(&mut app, 80, 24);
+    }
+
+    #[test]
+    fn draws_filter_editor() {
+        let mut app = App::new(
+            2,
+            SourceChoice::Tmdb,
+            Filters {
+                year_range: Some(YearRange {
+                    from: 1990,
+                    to: 1999,
+                }),
+                language: Language::Japanese,
+                popularity: Popularity::HiddenGems,
+            },
+        );
+        app.movies = vec![movie(1), movie(2)];
+        app.active_source = Some(Source::Tmdb);
+        app.open_filter_editor(FilterField::From);
+        let text = render(&mut app, 100, 35);
+        assert!(text.contains("Filters"));
+        assert!(text.contains("Language"));
+        assert!(text.contains("Japanese"));
+        assert!(text.contains("Popularity"));
+        assert!(text.contains("Hidden gems"));
+        assert!(!text.contains("TMDB only"));
+    }
+
+    #[test]
+    fn marks_popularity_as_tmdb_only_when_wikipedia_is_active() {
+        let mut app = App::new(
+            1,
+            SourceChoice::Wikipedia,
+            Filters {
+                popularity: Popularity::Popular,
+                ..Filters::default()
+            },
+        );
+        app.active_source = Some(Source::Wikipedia);
+        app.open_filter_editor(FilterField::Popularity);
+        let text = render(&mut app, 100, 35);
+        assert!(text.contains("Popular (TMDB only)"));
+        assert!(text.contains("TMDB only"));
     }
 
     #[test]

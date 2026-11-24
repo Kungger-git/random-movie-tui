@@ -19,6 +19,8 @@ and [ratatui-image](https://github.com/ratatui/ratatui-image).
 - Random movies with poster images, right in the terminal
 - Quick refresh (`space` or `r`)
 - Choose 1 to 20 movies with `--count`, number keys, or `+` / `-`
+- Pick a release-year range with `--from-year` / `--to-year` or the in-app editor
+- Filter by original language and popularity (popular or hidden gems)
 - TMDB data when an API key is available, Wikipedia as a keyless fallback
 - Kitty, Sixel, and iTerm2 graphics when supported, with a universal
   Unicode half-block fallback
@@ -60,12 +62,32 @@ random-movie-tui                     # one movie, TMDB if configured, else Wikip
 random-movie-tui --count 6           # a 6-poster grid
 random-movie-tui --source wikipedia  # force the keyless source
 random-movie-tui --source tmdb       # require TMDB
+random-movie-tui --from-year 1990 --to-year 1999  # movies from the 90s
+random-movie-tui --language ja       # original language: Japanese
+random-movie-tui --popularity hidden-gems  # lesser-known, well-rated movies
 random-movie-tui --halfblocks        # force Unicode half-block posters
 random-movie-tui --api-key KEY       # use a key for this run
 ```
 
 Number keys and `+` / `-` change the count while the app is running. Changing
 the count immediately fetches a new set.
+
+By default no year, language, or popularity filter is applied.
+`--from-year` and `--to-year` narrow the year range; either flag can be used
+alone. `--language` accepts a supported language name or ISO 639-1 code
+(`en`, `ja`, `fr`, …), and `--popularity` accepts `any`, `popular`, or
+`hidden-gems`. The selector includes English, Spanish, French, German,
+Italian, Portuguese, Japanese, Korean, Chinese, Hindi, Russian, Arabic,
+Turkish, Swedish, Dutch, Polish, and Danish.
+
+Press `f` in the app to open the Filters editor on the language row; `y` opens
+the same editor focused on the year fields. Changing any filter and pressing
+Enter fetches a new set.
+
+Language filtering uses TMDB's original-language data. With the keyless
+Wikipedia fallback it is best-effort, using categories such as
+`2024 Japanese-language films`. Popularity needs TMDB; on Wikipedia the header
+and Filters overlay mark it as `TMDB only` instead of applying it.
 
 ## Controls
 
@@ -74,6 +96,9 @@ the count immediately fetches a new set.
 | `space` / `r` | Pick another set of movies |
 | `1` – `9` | Show 1 to 9 movies |
 | `+` / `-` | Increase or decrease the count (up to 20) |
+| `f` | Choose filters: years, language, popularity |
+| `y` | Choose a release-year range |
+| `Tab` / arrows / digits / `Backspace` / `Enter` / `Esc` | Edit, change, apply, or cancel filters |
 | `←` `→` `↑` `↓` / `hjkl` | Move between movies |
 | Mouse wheel | Move between movies |
 | `PgUp` / `PgDn` | Jump a screenful |

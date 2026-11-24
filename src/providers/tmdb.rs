@@ -5,18 +5,22 @@ use reqwest::{Client, RequestBuilder, Url};
 use serde::Deserialize;
 
 use crate::{
-    config::{CredentialKind, Credentials},
+    config::{CredentialKind, Credentials, Filters},
     movie::{Movie, Source},
 };
 
 const DISCOVER_URL: &str = "https://api.themoviedb.org/3/discover/movie";
 const POSTER_BASE: &str = "https://image.tmdb.org/t/p/w500";
 const MAX_PAGES_TO_TRY: usize = 6;
+/// TMDB caps discover results at page 500.
+const MAX_DISCOVER_PAGE: u32 = 500;
 
 #[derive(Debug, Deserialize)]
 struct DiscoverResponse {
     #[serde(default)]
     results: Vec<RawMovie>,
+    #[serde(default)]
+    total_pages: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,37 +46,49 @@ struct ApiError {
     status_message: Option<String>,
 }
 
-pub async fn fetch(client: &Client, credentials: &Credentials, count: usize) -> Result<Vec<Movie>> {
+pub async fn fetch(
+    client: &Client,
+    credentials: &Credentials,
+    count: usize,
+    filters: &Filters,
+) -> Result<Vec<Movie>> {
     if count == 0 {
         return Ok(Vec::new());
     }
-
-    let mut pages: Vec<u32> = (1..=50).collect();
-    fastrand::shuffle(&mut pages);
 
     let mut movies = Vec::new();
     let mut seen = HashSet::new();
     let mut last_error = None;
 
-    for page in pages.into_iter().take(MAX_PAGES_TO_TRY) {
-        let raw = match fetch_page(client, credentials, page).await {
-            Ok(raw) => raw,
-            Err(error) => {
-                last_error = Some(error);
-                continue;
-            }
-        };
-
-        for raw in raw {
-            if let Some(movie) = into_movie(raw)
-                && seen.insert(movie.id.clone())
-            {
-                movies.push(movie);
-            }
+    // Page 1 tells us how many pages the current filters have, so narrow year
+    // ranges never request a page past the end.
+    let first = match fetch_page(client, credentials, filters, 1).await {
+        Ok(response) => Some(response),
+        Err(error) => {
+            last_error = Some(error);
+            None
         }
+    };
 
+    let mut pages = Vec::new();
+    if let Some(response) = &first {
+        let total_pages = response.total_pages.clamp(1, MAX_DISCOVER_PAGE);
+        let mut extra: Vec<u32> = (2..=total_pages).collect();
+        fastrand::shuffle(&mut extra);
+        pages.extend(extra.into_iter().take(MAX_PAGES_TO_TRY - 1));
+    }
+
+    if let Some(response) = first {
+        collect(response.results, &mut movies, &mut seen);
+    }
+
+    for page in pages {
         if movies.len() >= count {
             break;
+        }
+        match fetch_page(client, credentials, filters, page).await {
+            Ok(response) => collect(response.results, &mut movies, &mut seen),
+            Err(error) => last_error = Some(error),
         }
     }
 
@@ -80,7 +96,10 @@ pub async fn fetch(client: &Client, credentials: &Credentials, count: usize) -> 
         if let Some(error) = last_error {
             return Err(error);
         }
-        bail!("TMDB returned no movies with posters")
+        match filters.summary() {
+            summary if summary.is_empty() => bail!("TMDB returned no movies with posters"),
+            summary => bail!("TMDB returned no movies with posters for {summary}"),
+        }
     }
 
     fastrand::shuffle(&mut movies);
@@ -88,19 +107,23 @@ pub async fn fetch(client: &Client, credentials: &Credentials, count: usize) -> 
     Ok(movies)
 }
 
+fn collect(raw: Vec<RawMovie>, movies: &mut Vec<Movie>, seen: &mut HashSet<String>) {
+    for raw in raw {
+        if let Some(movie) = into_movie(raw)
+            && seen.insert(movie.id.clone())
+        {
+            movies.push(movie);
+        }
+    }
+}
+
 async fn fetch_page(
     client: &Client,
     credentials: &Credentials,
+    filters: &Filters,
     page: u32,
-) -> Result<Vec<RawMovie>> {
-    let mut url = Url::parse(DISCOVER_URL).expect("static URL is valid");
-    url.query_pairs_mut()
-        .append_pair("include_adult", "false")
-        .append_pair("include_video", "false")
-        .append_pair("language", "en-US")
-        .append_pair("sort_by", "popularity.desc")
-        .append_pair("vote_count.gte", "250")
-        .append_pair("page", &page.to_string());
+) -> Result<DiscoverResponse> {
+    let url = discover_url(filters, page);
 
     let response = authorized(client.get(url), credentials)
         .send()
@@ -131,8 +154,39 @@ async fn fetch_page(
         });
     }
 
-    let parsed: DiscoverResponse = serde_json::from_str(&body).context("invalid TMDB response")?;
-    Ok(parsed.results)
+    serde_json::from_str(&body).context("invalid TMDB response")
+}
+
+fn discover_url(filters: &Filters, page: u32) -> Url {
+    let mut url = Url::parse(DISCOVER_URL).expect("static URL is valid");
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs
+            .append_pair("include_adult", "false")
+            .append_pair("include_video", "false")
+            .append_pair("language", "en-US")
+            .append_pair("sort_by", "popularity.desc")
+            .append_pair(
+                "vote_count.gte",
+                &filters.popularity.min_votes().to_string(),
+            )
+            .append_pair("page", &page.to_string());
+        if let Some(max_votes) = filters.popularity.max_votes() {
+            pairs.append_pair("vote_count.lte", &max_votes.to_string());
+        }
+        if let Some(min_rating) = filters.popularity.min_rating() {
+            pairs.append_pair("vote_average.gte", &min_rating.to_string());
+        }
+        if let Some(code) = filters.language.code() {
+            pairs.append_pair("with_original_language", code);
+        }
+        if let Some(range) = filters.year_range {
+            pairs
+                .append_pair("primary_release_date.gte", &format!("{}-01-01", range.from))
+                .append_pair("primary_release_date.lte", &format!("{}-12-31", range.to));
+        }
+    }
+    url
 }
 
 fn authorized(request: RequestBuilder, credentials: &Credentials) -> RequestBuilder {
@@ -228,6 +282,7 @@ fn genre_name(id: u16) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Language, Popularity, YearRange};
 
     #[test]
     fn parses_year() {
@@ -274,10 +329,112 @@ mod tests {
             .user_agent("random-movie-tui-test/0.1")
             .build()
             .unwrap();
-        let movies = fetch(&client, &credentials, 3).await.unwrap();
+        let movies = fetch(&client, &credentials, 3, &Filters::default())
+            .await
+            .unwrap();
         assert!(!movies.is_empty());
         assert!(movies.iter().all(|movie| movie.poster_url.is_some()));
         assert!(movies.iter().all(|movie| movie.source == Source::Tmdb));
+    }
+
+    #[test]
+    fn discover_url_includes_year_range() {
+        let filters = Filters {
+            year_range: Some(YearRange {
+                from: 1990,
+                to: 1999,
+            }),
+            ..Filters::default()
+        };
+        let url = discover_url(&filters, 3);
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(
+            query
+                .get("primary_release_date.gte")
+                .map(|value| value.as_ref()),
+            Some("1990-01-01")
+        );
+        assert_eq!(
+            query
+                .get("primary_release_date.lte")
+                .map(|value| value.as_ref()),
+            Some("1999-12-31")
+        );
+        assert_eq!(query.get("page").map(|value| value.as_ref()), Some("3"));
+    }
+
+    #[test]
+    fn discover_url_omits_year_range_when_unset() {
+        let url = discover_url(&Filters::default(), 1);
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert!(!query.contains_key("primary_release_date.gte"));
+        assert!(!query.contains_key("primary_release_date.lte"));
+    }
+
+    #[test]
+    fn discover_url_includes_original_language() {
+        let filters = Filters {
+            language: Language::Japanese,
+            ..Filters::default()
+        };
+        let url = discover_url(&filters, 1);
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(
+            query
+                .get("with_original_language")
+                .map(|value| value.as_ref()),
+            Some("ja")
+        );
+    }
+
+    #[test]
+    fn discover_url_omits_language_when_any() {
+        let url = discover_url(&Filters::default(), 1);
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert!(!query.contains_key("with_original_language"));
+    }
+
+    #[test]
+    fn discover_url_applies_popularity_tiers() {
+        let any = discover_url(&Filters::default(), 1);
+        let any_query: std::collections::HashMap<_, _> = any.query_pairs().collect();
+        assert_eq!(
+            any_query.get("vote_count.gte").map(|value| value.as_ref()),
+            Some("250")
+        );
+        assert!(!any_query.contains_key("vote_count.lte"));
+        assert!(!any_query.contains_key("vote_average.gte"));
+
+        let popular = Filters {
+            popularity: Popularity::Popular,
+            ..Filters::default()
+        };
+        let url = discover_url(&popular, 1);
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(
+            query.get("vote_count.gte").map(|value| value.as_ref()),
+            Some("1000")
+        );
+        assert!(!query.contains_key("vote_count.lte"));
+
+        let hidden = Filters {
+            popularity: Popularity::HiddenGems,
+            ..Filters::default()
+        };
+        let url = discover_url(&hidden, 1);
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(
+            query.get("vote_count.gte").map(|value| value.as_ref()),
+            Some("50")
+        );
+        assert_eq!(
+            query.get("vote_count.lte").map(|value| value.as_ref()),
+            Some("750")
+        );
+        assert_eq!(
+            query.get("vote_average.gte").map(|value| value.as_ref()),
+            Some("6.5")
+        );
     }
 
     #[test]

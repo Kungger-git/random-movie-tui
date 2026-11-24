@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 
 use crate::{
-    config::{Credentials, SourceChoice},
+    config::{Credentials, Filters, SourceChoice},
     movie::{Movie, Source},
 };
 
@@ -48,41 +48,42 @@ impl Providers {
         &self.client
     }
 
-    pub fn has_credentials(&self) -> bool {
-        self.credentials.is_some()
-    }
-
-    pub async fn fetch(&self, count: usize) -> Result<Batch> {
+    pub async fn fetch(&self, count: usize, filters: &Filters) -> Result<Batch> {
         match self.mode {
-            SourceChoice::Wikipedia => self.fetch_wikipedia(count, None).await,
+            SourceChoice::Wikipedia => self.fetch_wikipedia(count, filters, None).await,
             SourceChoice::Tmdb => {
                 let credentials = self.credentials.as_ref().context(
                     "No TMDB API key found. Set TMDB_API_KEY, add one to \
                      ~/.config/random-movie-tui/config.toml, or run with --source wikipedia.",
                 )?;
-                let movies = tmdb::fetch(&self.client, credentials, count).await?;
+                let movies = tmdb::fetch(&self.client, credentials, count, filters).await?;
                 Ok(finish(Source::Tmdb, movies, count, None))
             }
             SourceChoice::Auto => {
                 let Some(credentials) = self.credentials.as_ref() else {
-                    return self.fetch_wikipedia(count, None).await;
+                    return self.fetch_wikipedia(count, filters, None).await;
                 };
-                match tmdb::fetch(&self.client, credentials, count).await {
+                match tmdb::fetch(&self.client, credentials, count, filters).await {
                     Ok(movies) => Ok(finish(Source::Tmdb, movies, count, None)),
                     Err(tmdb_error) => {
                         let reason = short_error(&tmdb_error);
                         let warning = format!("TMDB unavailable ({reason}); using Wikipedia");
-                        self.fetch_wikipedia(count, Some(warning)).await
+                        self.fetch_wikipedia(count, filters, Some(warning)).await
                     }
                 }
             }
         }
     }
 
-    async fn fetch_wikipedia(&self, count: usize, warning: Option<String>) -> Result<Batch> {
+    async fn fetch_wikipedia(
+        &self,
+        count: usize,
+        filters: &Filters,
+        warning: Option<String>,
+    ) -> Result<Batch> {
         let movies = self
             .wikipedia
-            .fetch(&self.client, count)
+            .fetch(&self.client, count, filters)
             .await
             .context("Wikipedia fallback failed")?;
         Ok(finish(Source::Wikipedia, movies, count, warning))

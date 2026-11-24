@@ -7,7 +7,10 @@ use anyhow::{Context, Result, bail};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 
-use crate::movie::{Movie, Source};
+use crate::{
+    config::{Filters, Language, YearRange},
+    movie::{Movie, Source},
+};
 
 const API_URL: &str = "https://en.wikipedia.org/w/api.php";
 const MAX_TITLES_PER_BATCH: usize = 30;
@@ -55,7 +58,7 @@ struct Thumbnail {
     height: u32,
 }
 
-type CategoryCache = HashMap<(u16, Option<char>), Vec<String>>;
+type CategoryCache = HashMap<(u16, Option<char>, Language), Vec<String>>;
 
 pub struct WikipediaProvider {
     categories: Mutex<CategoryCache>,
@@ -68,7 +71,13 @@ impl WikipediaProvider {
         }
     }
 
-    pub async fn fetch(&self, client: &Client, count: usize) -> Result<Vec<Movie>> {
+    pub async fn fetch(
+        &self,
+        client: &Client,
+        count: usize,
+        filters: &Filters,
+    ) -> Result<Vec<Movie>> {
+        let range = filters.year_range.unwrap_or_else(YearRange::full);
         let count = count.max(1);
         let years_target = count.div_ceil(3).clamp(1, 4);
         let per_year = count.div_ceil(years_target).max(1);
@@ -84,10 +93,10 @@ impl WikipediaProvider {
                 break;
             }
 
-            let year = pick_year(&used_years, attempt >= years_target);
+            let year = pick_year(&range, &used_years, attempt >= years_target);
             used_years.insert(year);
 
-            let members = match self.members(client, year).await {
+            let members = match self.members(client, year, filters.language).await {
                 Ok(members) => members,
                 Err(error) => {
                     last_error = Some(error);
@@ -139,28 +148,34 @@ impl WikipediaProvider {
             if let Some(error) = last_error {
                 return Err(error);
             }
-            bail!("Wikipedia returned no movies with posters; try refreshing")
+            match wikipedia_summary(filters) {
+                summary if summary.is_empty() => {
+                    bail!("Wikipedia returned no movies with posters; try refreshing")
+                }
+                summary => bail!("Wikipedia returned no movies with posters for {summary}"),
+            }
         }
 
         fastrand::shuffle(&mut movies);
         Ok(movies)
     }
 
-    async fn members(&self, client: &Client, year: u16) -> Result<Vec<String>> {
-        let prefix = fastrand::bool().then(|| (b'A' + fastrand::u8(0..26)) as char);
-        let key = (year, prefix);
+    async fn members(&self, client: &Client, year: u16, language: Language) -> Result<Vec<String>> {
+        let prefix = (language == Language::Any && fastrand::bool())
+            .then(|| (b'A' + fastrand::u8(0..26)) as char);
+        let key = (year, prefix, language);
 
         if let Some(cached) = self.cached(key) {
             return Ok(cached);
         }
 
-        let titles = fetch_members(client, year, prefix).await?;
-        let titles = if titles.len() < 8 && prefix.is_some() {
-            if let Some(cached) = self.cached((year, None)) {
+        let titles = fetch_members(client, year, prefix, language).await?;
+        let titles = if language == Language::Any && titles.len() < 8 && prefix.is_some() {
+            if let Some(cached) = self.cached((year, None, language)) {
                 cached
             } else {
-                let all = fetch_members(client, year, None).await?;
-                self.store((year, None), &all);
+                let all = fetch_members(client, year, None, language).await?;
+                self.store((year, None, language), &all);
                 all
             }
         } else {
@@ -171,14 +186,14 @@ impl WikipediaProvider {
         Ok(titles)
     }
 
-    fn cached(&self, key: (u16, Option<char>)) -> Option<Vec<String>> {
+    fn cached(&self, key: (u16, Option<char>, Language)) -> Option<Vec<String>> {
         self.categories
             .lock()
             .ok()
             .and_then(|cache| cache.get(&key).cloned())
     }
 
-    fn store(&self, key: (u16, Option<char>), titles: &[String]) {
+    fn store(&self, key: (u16, Option<char>, Language), titles: &[String]) {
         if let Ok(mut cache) = self.categories.lock() {
             cache.insert(key, titles.to_vec());
         }
@@ -214,7 +229,12 @@ impl WikipediaProvider {
     }
 }
 
-async fn fetch_members(client: &Client, year: u16, prefix: Option<char>) -> Result<Vec<String>> {
+async fn fetch_members(
+    client: &Client,
+    year: u16,
+    prefix: Option<char>,
+    language: Language,
+) -> Result<Vec<String>> {
     let mut url = Url::parse(API_URL).expect("static URL is valid");
     {
         let mut pairs = url.query_pairs_mut();
@@ -223,7 +243,7 @@ async fn fetch_members(client: &Client, year: u16, prefix: Option<char>) -> Resu
             .append_pair("format", "json")
             .append_pair("formatversion", "2")
             .append_pair("list", "categorymembers")
-            .append_pair("cmtitle", &format!("Category:{year} films"))
+            .append_pair("cmtitle", &category_title(year, language))
             .append_pair("cmtype", "page")
             .append_pair("cmlimit", "500");
         if let Some(prefix) = prefix {
@@ -255,24 +275,32 @@ async fn fetch_members(client: &Client, year: u16, prefix: Option<char>) -> Resu
         .collect())
 }
 
-fn pick_year(used: &HashSet<u16>, allow_repeat: bool) -> u16 {
-    let current = current_year();
+fn category_title(year: u16, language: Language) -> String {
+    match language {
+        Language::Any => format!("Category:{year} films"),
+        _ => format!("Category:{year} {}-language films", language.label()),
+    }
+}
+
+fn wikipedia_summary(filters: &Filters) -> String {
+    let mut parts = Vec::new();
+    if let Some(range) = filters.year_range {
+        parts.push(range.label());
+    }
+    if filters.language != Language::Any {
+        parts.push(filters.language.label().to_owned());
+    }
+    parts.join(" · ")
+}
+
+fn pick_year(range: &YearRange, used: &HashSet<u16>, allow_repeat: bool) -> u16 {
     for _ in 0..12 {
-        let year = fastrand::u16(1920..=current);
+        let year = fastrand::u16(range.from..=range.to);
         if allow_repeat || !used.contains(&year) {
             return year;
         }
     }
-    fastrand::u16(1920..=current)
-}
-
-fn current_year() -> u16 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    1970 + (secs / 31_556_952) as u16
+    fastrand::u16(range.from..=range.to)
 }
 
 fn page_into_movie(page: Page, category_year: u16) -> Option<Movie> {
@@ -439,6 +467,7 @@ fn genres_from_description(description: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Popularity;
 
     fn thumbnail(width: u32, height: u32) -> Thumbnail {
         Thumbnail {
@@ -511,10 +540,58 @@ mod tests {
             .build()
             .unwrap();
         let provider = WikipediaProvider::new();
-        let movies = provider.fetch(&client, 3).await.unwrap();
+        let movies = provider
+            .fetch(&client, 3, &Filters::default())
+            .await
+            .unwrap();
         assert!(!movies.is_empty());
         assert!(movies.iter().all(|movie| movie.poster_url.is_some()));
         assert!(movies.iter().all(|movie| movie.source == Source::Wikipedia));
+    }
+
+    #[test]
+    fn builds_language_category_titles() {
+        assert_eq!(category_title(2024, Language::Any), "Category:2024 films");
+        assert_eq!(
+            category_title(2024, Language::Japanese),
+            "Category:2024 Japanese-language films"
+        );
+    }
+
+    #[test]
+    fn wikipedia_summary_omits_unsupported_popularity() {
+        let filters = Filters {
+            year_range: Some(YearRange {
+                from: 1990,
+                to: 1999,
+            }),
+            language: Language::Japanese,
+            popularity: Popularity::Popular,
+        };
+        assert_eq!(wikipedia_summary(&filters), "1990–1999 · Japanese");
+    }
+
+    #[test]
+    fn picks_years_inside_the_range() {
+        let range = YearRange {
+            from: 1990,
+            to: 1999,
+        };
+        let used = HashSet::new();
+        for _ in 0..200 {
+            let year = pick_year(&range, &used, false);
+            assert!((range.from..=range.to).contains(&year));
+        }
+    }
+
+    #[test]
+    fn picks_the_only_year_in_a_single_year_range() {
+        let range = YearRange {
+            from: 1999,
+            to: 1999,
+        };
+        let used = HashSet::new();
+        assert_eq!(pick_year(&range, &used, false), 1999);
     }
 
     #[test]
